@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Hunting Prototype — First Person</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  html,body{height:100%;margin:0;overflow:hidden;background:#111;color:#ddd;font-family:Arial,Helvetica,sans-serif}
+  #overlay{position:absolute;left:10px;top:10px;z-index:5;background:rgba(0,0,0,0.4);padding:8px;border-radius:6px}
+  #hud{position:absolute;right:10px;top:10px;z-index:5;background:rgba(0,0,0,0.4);padding:8px;border-radius:6px;text-align:right}
+  button{background:#2a7;color:#012;border:none;padding:6px 10px;border-radius:6px;margin:2px;cursor:pointer;font-weight:700}
+  #canvas-holder{width:100%;height:100%}
+  #msg{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.7);padding:12px;border-radius:8px;display:none;z-index:10}
+  #controls{font-size:13px;color:#eee;margin-top:6px}
+  select{background:#223;color:#eee;padding:4px;border-radius:4px;border:1px solid #444}
+</style>
+</head>
+<body>
+<div id="overlay">
+  <div style="font-weight:700">Hunting Prototype (WebGL)</div>
+  <div id="status">Loading...</div>
+  <div id="controls">
+    Weapon:
+    <select id="weaponSelect">
+      <option value="pistol">10mm Pistol</option>
+      <option value="ar">.223 Rifle (semi-auto)</option>
+      <option value="bolt">.300 Win Mag (bolt-action)</option>
+    </select>
+    <br>
+    Location:
+    <select id="mapSelect">
+      <option value="forest">Forest</option>
+      <option value="mountain">Mountain</option>
+    </select>
+    <br>
+    <button id="startBtn">Start</button>
+    <button id="helpBtn">Help</button>
+    <div style="margin-top:6px;font-size:12px">Controls: WASD move • Mouse look • Click to shoot • Right-click to aim • R to reload • Shift to run</div>
+  </div>
+</div>
+<div id="hud">
+  <div id="score">Score: 0</div>
+  <div id="ammo">Ammo: -</div>
+</div>
+<div id="msg"></div>
+<div id="canvas-holder"></div>
+
+<!-- Three.js from CDN -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r152/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r152/examples/js/controls/PointerLockControls.js"></script>
+<script>
+// Basic Hunting Prototype
+let scene, camera, renderer, controls;
+let clock = new THREE.Clock();
+let objects = [];
+let animals = [];
+let bullets = [];
+let score = 0;
+let running = false;
+let map = 'forest';
+
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+let masterGain = audioCtx.createGain(); masterGain.gain.value = 0.9; masterGain.connect(audioCtx.destination);
+
+function sfxGunShot(freq, duration=0.12, volume=0.6){
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = 'triangle'; o.frequency.value = freq;
+  g.gain.value = volume;
+  o.connect(g); g.connect(masterGain);
+  o.start();
+  g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+  setTimeout(()=>{ o.stop(); o.disconnect(); g.disconnect(); }, duration*1000 + 50);
+}
+
+function sfxAmbient(freq, dur=0.5, vol=0.08){
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type='sine'; o.frequency.value = freq;
+  g.gain.value = vol;
+  o.connect(g); g.connect(masterGain);
+  o.start();
+  g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+  setTimeout(()=>{ o.stop(); o.disconnect(); g.disconnect(); }, dur*1000 + 50);
+}
+
+function sfxBirdCall(){
+  const t = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  t.type='sawtooth'; t.frequency.value = 1200;
+  g.gain.value = 0.04;
+  t.connect(g); g.connect(masterGain);
+  t.start();
+  setTimeout(()=>{ t.frequency.value = 1800; }, 150);
+  setTimeout(()=>{ g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.6); }, 300);
+  setTimeout(()=>{ t.stop(); t.disconnect(); g.disconnect(); }, 800);
+}
+
+// Weapon definitions (basic ballistic params)
+const weapons = {
+  pistol: {name:'10mm Pistol', mag:12, rpm:400, speed:320, drop:0.0009, reload:1200, lastFire:0, spread:0.01, bolt:false, dmg:45},
+  ar: {name:'.223 Rifle', mag:30, rpm:650, speed:700, drop:0.0006, reload:1700, lastFire:0, spread:0.008, bolt:false, dmg:60},
+  bolt: {name:'.300 Win Mag', mag:5, rpm:45, speed:1000, drop:0.0005, reload:2500, lastFire:0, spread:0.004, bolt:true, dmg:110}
+};
+let currentWeapon = 'pistol';
+let ammo = weapons[currentWeapon].mag, isReloading=false;
+
+// UI hooks
+const statusEl = document.getElementById('status');
+const scoreEl = document.getElementById('score');
+const ammoEl = document.getElementById('ammo');
+const startBtn = document.getElementById('startBtn');
+const weaponSelect = document.getElementById('weaponSelect');
+const mapSelect = document.getElementById('mapSelect');
+const msgEl = document.getElementById('msg');
+const helpBtn = document.getElementById('helpBtn');
+
+weaponSelect.addEventListener('change', ()=>{
+  currentWeapon = weaponSelect.value;
+  ammo = weapons[currentWeapon].mag;
+  updateHUD();
+});
+mapSelect.addEventListener('change', ()=>{ map = mapSelect.value; });
+
+helpBtn.addEventListener('click', ()=>{
+  alert('Hunting Prototype Help:\\n- WASD to move, mouse look to aim.\\n- Left click to shoot, right click to aim (hold).\\n- R to reload. Shift to sprint.\\n- Use the select boxes to change weapon and location before starting.');
+});
+
+startBtn.addEventListener('click', ()=>{
+  if(!running) start(); else stopGame();
+});
+
+function updateHUD(){ scoreEl.textContent = 'Score: ' + score; ammoEl.textContent = 'Ammo: ' + (isReloading? 'Reloading...' : (ammo + '/' + weapons[currentWeapon].mag)); }
+
+function init(){
+  // Scene + camera
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x88ccee);
+  camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 2000);
+  renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  document.getElementById('canvas-holder').appendChild(renderer.domElement);
+
+  // Light
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x444455, 1.0);
+  hemi.position.set(0,200,0);
+  scene.add(hemi);
+  const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+  dir.position.set(-100,200,100);
+  scene.add(dir);
+
+  // Ground
+  const gGeo = new THREE.PlaneGeometry(2000,2000,8,8);
+  const gMat = new THREE.MeshLambertMaterial({color:0x447744});
+  const ground = new THREE.Mesh(gGeo, gMat);
+  ground.rotation.x = -Math.PI/2;
+  ground.position.y = -1;
+  scene.add(ground);
+
+  // Basic environment objects (trees/rocks)
+  addEnvironment();
+
+  // Controls (pointer lock)
+  controls = new THREE.PointerLockControls(camera, renderer.domElement);
+  const blocker = document.getElementById('overlay');
+  renderer.domElement.addEventListener('click', ()=>{
+    if(!running) return;
+    controls.lock();
+    // resume audio context on iOS
+    try{ audioCtx.resume(); }catch(e){}
+  });
+
+  controls.addEventListener('lock', ()=>{ statusEl.textContent = 'Locked - Playing'; });
+  controls.addEventListener('unlock', ()=>{ statusEl.textContent = 'Unlocked'; });
+
+  // set initial camera position
+  camera.position.set(0, 2, 5);
+
+  window.addEventListener('resize', onWindowResize);
+  updateHUD();
+  animate();
+}
+
+function addEnvironment(){
+  // Populate with low-poly trees/rocks depending on map
+  for(let i=0;i<200;i++){
+    const x = (Math.random()-0.5)*1500;
+    const z = (Math.random()-0.5)*1500;
+    const h = (map === 'mountain') ? (4 + Math.random()*6) : (6 + Math.random()*8);
+    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.4,0.6, h*0.6, 6), new THREE.MeshLambertMaterial({color:0x8b5a2b}));
+    trunk.position.set(x, h*0.3, z);
+    const foliage = new THREE.Mesh(new THREE.ConeGeometry(h*0.8, h, 6), new THREE.MeshLambertMaterial({color: (map==='mountain'?0x99aa99:0x116622)}));
+    foliage.position.set(x, h*0.9, z);
+    scene.add(trunk); scene.add(foliage);
+    objects.push(trunk); objects.push(foliage);
+  }
+
+  // Add some rocks
+  for(let i=0;i<80;i++){
+    const x = (Math.random()-0.5)*1200;
+    const z = (Math.random()-0.5)*1200;
+    const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(1 + Math.random()*3), new THREE.MeshLambertMaterial({color:0x666666}));
+    rock.position.set(x, 0.3 + Math.random()*0.4, z);
+    rock.rotation.set(Math.random(), Math.random(), Math.random());
+    scene.add(rock); objects.push(rock);
+  }
+}
+
+function spawnAnimal(type){
+  const pos = new THREE.Vector3((Math.random()-0.5)*800, 0, (Math.random()-0.5)*800);
+  let mesh;
+  if(type==='deer'){
+    mesh = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(1.6,0.9,0.8), new THREE.MeshLambertMaterial({color:0x8a6234}));
+    body.position.set(0,0.6,0);
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.5,0.4,0.5), new THREE.MeshLambertMaterial({color:0x6b3f2a}));
+    head.position.set(0.9,0.9,0);
+    mesh.add(body); mesh.add(head);
+    mesh.userData = {type:'deer', hp:100, speed:1.2, alert:false};
+  } else if(type==='wolf'){
+    mesh = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(1.2,0.6,0.5), new THREE.MeshLambertMaterial({color:0x666666}));
+    body.position.set(0,0.5,0);
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.4,0.3,0.4), new THREE.MeshLambertMaterial({color:0x444444}));
+    head.position.set(0.7,0.65,0);
+    mesh.add(body); mesh.add(head);
+    mesh.userData = {type:'wolf', hp:160, speed:1.6, aggressive:false};
+  } else if(type==='bird'){
+    mesh = new THREE.Mesh(new THREE.SphereGeometry(0.18,6,6), new THREE.MeshLambertMaterial({color:0xffff99}));
+    mesh.userData = {type:'bird', hp:20, speed:3.2, flying:true};
+  }
+  mesh.position.copy(pos);
+  scene.add(mesh); animals.push(mesh);
+}
+
+function updateAnimals(dt){
+  for(let i=animals.length-1;i>=0;i--){
+    const a = animals[i];
+    const ud = a.userData;
+    // simple behavior: wandering; deer flee if close, wolf hunt if sees player
+    if(ud.type==='deer'){
+      // wander
+      a.userData._dir = a.userData._dir || new THREE.Vector3(Math.random()-0.5,0,Math.random()-0.5).normalize();
+      if(Math.random() < 0.01) a.userData._dir = new THREE.Vector3(Math.random()-0.5,0,Math.random()-0.5).normalize();
+      const move = a.userData._dir.clone().multiplyScalar(ud.speed * dt * 0.5);
+      a.position.add(move);
+
+      // if too close to camera, flee
+      const dist = a.position.distanceTo(camera.position);
+      if(dist < 20){
+        const flee = a.position.clone().sub(camera.position).normalize().multiplyScalar(ud.speed * dt * 2.2);
+        a.position.add(flee);
+        a.userData.alert = true;
+        sfxBirdCall();
+      } else a.userData.alert = false;
+    } else if(ud.type==='wolf'){
+      // wolves may detect player and become aggressive
+      const dist = a.position.distanceTo(camera.position);
+      if(!ud.aggressive && Math.random() < 0.002 && dist < 100) ud.aggressive = true;
+      if(ud.aggressive){
+        // approach player
+        const dir = camera.position.clone().sub(a.position).setY(0).normalize();
+        a.position.add(dir.multiplyScalar(ud.speed * dt * 0.8));
+
+        // if very close, play growl and damage (not implementing player HP here)
+        if(dist < 6 && Math.random() < 0.02) sfxAmbient(120,0.2,0.12);
+      } else {
+        // wander
+        a.userData._dir = a.userData._dir || new THREE.Vector3(Math.random()-0.5,0,Math.random()-0.5).normalize();
+        if(Math.random() < 0.01) a.userData._dir = new THREE.Vector3(Math.random()-0.5,0,Math.random()-0.5).normalize();
+        a.position.add(a.userData._dir.clone().multiplyScalar(ud.speed * dt * 0.4));
+      }
+    } else if(ud.type==='bird'){
+      // simple flying pattern
+      a.userData._dir = a.userData._dir || new THREE.Vector3(Math.random()-0.5,Math.random()*0.4,Math.random()-0.5).normalize();
+      if(Math.random() < 0.02) a.userData._dir = new THREE.Vector3(Math.random()-0.5,Math.random()*0.4,Math.random()-0.5).normalize();
+      a.position.add(a.userData._dir.clone().multiplyScalar(ud.speed * dt * 0.8));
+      // keep birds above ground
+      if(a.position.y < 8) a.position.y = 8 + Math.random()*10;
+      if(a.position.distanceTo(camera.position) < 30){
+        // startled
+        a.userData._dir = a.position.clone().sub(camera.position).normalize();
+        sfxBirdCall();
+      }
+    }
+    // remove animals that wander too far
+    if(a.position.length() > 2000){ scene.remove(a); animals.splice(i,1); }
+  }
+}
+
+// -- Shooting / ballistics --
+function fireShot(){
+  if(isReloading) return;
+  const wpn = weapons[currentWeapon];
+  const now = performance.now();
+  const canFire = (now - wpn.lastFire) > (60000 / wpn.rpm);
+  if(!canFire) return;
+  if(ammo <= 0){
+    sfxAmbient(200,0.08,0.05); return;
+  }
+  // fire
+  wpn.lastFire = now;
+  ammo--;
+  updateHUD();
+  // muzzle sound (vary by weapon)
+  if(currentWeapon==='pistol') sfxGunShot(800,0.12,0.6);
+  if(currentWeapon==='ar') sfxGunShot(1000,0.14,0.7);
+  if(currentWeapon==='bolt') sfxGunShot(600,0.18,0.9);
+
+  // raycast from camera direction with spread and ballistic drop simulated over time by creating a bullet object
+  const spread = wpn.spread;
+  const dir = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+  // apply a tiny random spread
+  dir.x += (Math.random()-0.5)*spread; dir.y += (Math.random()-0.5)*spread; dir.z += (Math.random()-0.5)*spread;
+  dir.normalize();
+  const pos = camera.position.clone();
+  // bullet object
+  bullets.push({pos, dir, speed: wpn.speed, drop: wpn.drop, dmg: wpn.dmg, life: 2000, created: performance.now()});
+  // recoil: small camera kick
+  camera.rotation.x -= 0.01 * (currentWeapon==='bolt'?1.2:0.6);
+  // bolt-action delay for bolt rifle (simulate slow rpm)
+  if(wpn.bolt){
+    // small delay sound
+    setTimeout(()=> sfxAmbient(300,0.05,0.04), 200);
+  }
+}
+
+function updateBullets(dt){
+  for(let i=bullets.length-1;i>=0;i--){
+    const b = bullets[i];
+    // move bullet along dir with speed, apply drop to dir.y progressively
+    b.dir.y -= b.drop * dt; // gravity-ish
+    const move = b.dir.clone().multiplyScalar(b.speed * dt * 0.001);
+    b.pos.add(move);
+    // collision test with animals (sphere intersection)
+    for(let j=0;j<animals.length;j++){
+      const a = animals[j];
+      const dist = a.position.distanceTo(b.pos);
+      const size = (a.userData.type==='deer'?1.2:(a.userData.type==='wolf'?1.0:0.25));
+      if(dist < size + 0.6){
+        // hit
+        a.userData.hp -= b.dmg;
+        // visual hit indicator
+        flashRed();
+        // remove bullet
+        bullets.splice(i,1);
+        // animal death
+        if(a.userData.hp <= 0){
+          // remove animal, add score based on type
+          let pts = 0;
+          if(a.userData.type==='deer') pts = 50;
+          if(a.userData.type==='wolf') pts = 120;
+          if(a.userData.type==='bird') pts = 20;
+          score += pts;
+          updateHUD();
+          scene.remove(a);
+          animals.splice(j,1);
+        }
+        break;
+      }
+    }
+    // remove if too old or far
+    if(b.pos.length() > 4000 || (performance.now() - b.created) > b.life){
+      bullets.splice(i,1);
+    }
+  }
+}
+
+// small hit flash
+let flashTimer = 0;
+function flashRed(){ flashTimer = 0.2; }
+
+// reload
+function reloadWeapon(){
+  if(isReloading) return;
+  isReloading = true;
+  const wpn = weapons[currentWeapon];
+  setTimeout(()=>{
+    ammo = wpn.mag; isReloading = false; updateHUD();
+  }, wpn.reload);
+  // play small reload tone
+  sfxAmbient(400,0.12,0.08);
+  updateHUD();
+}
+
+// basic HUD flash overlay
+function renderHUDOverlay(){
+  if(flashTimer > 0){
+    const opacity = flashTimer * 0.7;
+    const ctx = renderer.domElement.getContext('2d');
+    // don't draw here, instead use CSS overlay - simpler: tint the screen via scene fog color shift
+  }
+}
+
+// animate loop
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = clock.getDelta();
+  if(running && controls.isLocked === true){
+    // movement
+    const speed = (keyState['Shift']?6:3);
+    let forward = (keyState['w']?1:0) + (keyState['W']?1:0);
+    let back = (keyState['s']?1:0) + (keyState['S']?1:0);
+    let left = (keyState['a']?1:0) + (keyState['A']?1:0);
+    let right = (keyState['d']?1:0) + (keyState['D']?1:0);
+    const dir = new THREE.Vector3();
+    if(forward) dir.z -= 1;
+    if(back) dir.z += 1;
+    if(left) dir.x -= 1;
+    if(right) dir.x += 1;
+    dir.normalize();
+    controls.getObject().translateX(dir.x * dt * speed);
+    controls.getObject().translateZ(dir.z * dt * speed);
+    // update animals & bullets
+    updateAnimals(dt*60); // scale dt for visible movement
+    updateBullets(dt*1000);
+  }
+  // render scene
+  if(map === 'mountain') scene.background.set(0xbfe0ff); else scene.background.set(0x88ccee);
+  // draw simple scope overlay when right mouse button down
+  renderer.render(scene, camera);
+  // handle screen flash fade
+  if(flashTimer > 0) flashTimer -= dt;
+}
+
+// Input handling
+let keyState = {};
+document.addEventListener('keydown', (e)=>{ keyState[e.key]=true; if(e.key==='r' || e.key==='R') reloadWeapon(); if(e.key===' '){ e.preventDefault(); fireShot(); } });
+document.addEventListener('keyup', (e)=>{ keyState[e.key]=false; });
+
+// Mouse input for shooting and aiming
+renderer?.domElement;
+window.addEventListener('mousedown', (e)=>{
+  if(!running) return;
+  if(e.button === 0) fireShot();
+  if(e.button === 2){ // right button - aim (simple: reduce spread and slow movement)
+    // reduce spread by temporarily adjusting weapon spread
+    weapons[currentWeapon]._oldSpread = weapons[currentWeapon].spread;
+    weapons[currentWeapon].spread *= 0.25;
+    // slow movement
+    keyState['aiming'] = true;
+  }
+});
+window.addEventListener('mouseup', (e)=>{
+  if(e.button === 2){
+    weapons[currentWeapon].spread = weapons[currentWeapon]._oldSpread || weapons[currentWeapon].spread;
+    keyState['aiming'] = false;
+  }
+});
+// prevent context menu
+window.addEventListener('contextmenu', (e)=>{ e.preventDefault(); });
+
+// Spawn animals periodically
+let lastSpawn = performance.now();
+function animalSpawner(){
+  if(!running) return;
+  const now = performance.now();
+  if(now - lastSpawn > 1600){
+    lastSpawn = now;
+    // spawn based on probabilities
+    const r = Math.random();
+    if(r < 0.6) spawnAnimal('deer');
+    else if(r < 0.85) spawnAnimal('bird');
+    else spawnAnimal('wolf');
+    // random ambient bird calls
+    if(Math.random() < 0.15) sfxBirdCall();
+  }
+  setTimeout(animalSpawner, 600 + Math.random()*1400);
+}
+
+// small visual crosshair
+function drawCrosshair(){
+  const ctx = renderer.domElement.getContext('2d');
+  // clear overlay? We're not using 2D overlay; instead draw with CSS maybe later
+}
+
+// start and stop
+function start(){
+  running = true;
+  statusEl.textContent = 'Starting... Click the canvas to lock pointer and play';
+  startBtn.textContent = 'Stop';
+  // spawn a few animals to begin
+  for(let i=0;i<10;i++){ spawnAnimal('deer'); }
+  for(let i=0;i<3;i++){ spawnAnimal('bird'); }
+  setTimeout(animalSpawner, 600);
+  // resume audio
+  try{ audioCtx.resume(); }catch(e){}
+}
+
+function stopGame(){
+  running = false;
+  startBtn.textContent = 'Start';
+  statusEl.textContent = 'Stopped';
+}
+
+// small UI loop
+function uiLoop(){
+  updateHUD();
+  requestAnimationFrame(uiLoop);
+}
+
+// small hit indicator - red overlay using CSS
+(function addFlashOverlay(){
+  const overlay = document.createElement('div');
+  overlay.style.position='fixed'; overlay.style.left='0'; overlay.style.top='0'; overlay.style.width='100%'; overlay.style.height='100%';
+  overlay.style.pointerEvents='none'; overlay.style.mixBlendMode='overlay'; overlay.style.zIndex='4';
+  overlay.id = 'hitOverlay';
+  document.body.appendChild(overlay);
+  setInterval(()=>{
+    const el = document.getElementById('hitOverlay');
+    if(!el) return;
+    if(flashTimer > 0){ el.style.background = 'rgba(255,100,100,' + (flashTimer*0.15) + ')'; }
+    else el.style.background = 'transparent';
+  }, 50);
+})();
+
+// initialize scene and UI
+init();
+uiLoop();
+
+// expose updateHUD for external changes
+window.updateHUD = updateHUD;
+
+// initial status
+statusEl.textContent = 'Ready — choose weapon & location, then click Start.';
+
+</script>
+</body>
+</html>
